@@ -164,6 +164,57 @@ struct AppModelSessionListTests {
     }
 
     @Test
+    func islandListKeepsDistinctCodexAppThreadsInTheSameWorkspace() {
+        let now = Date(timeIntervalSince1970: 2_000)
+        let model = AppModel()
+
+        var firstThread = AgentSession(
+            id: "codex-app-thread-1",
+            title: "Codex · open-island",
+            tool: .codex,
+            origin: .live,
+            attachmentState: .attached,
+            phase: .completed,
+            summary: "First Codex.app thread",
+            updatedAt: now,
+            jumpTarget: JumpTarget(
+                terminalApp: "Codex.app",
+                workspaceName: "open-island",
+                paneTitle: "Codex · open-island",
+                workingDirectory: "/tmp/open-island",
+                codexThreadID: "codex-app-thread-1"
+            )
+        )
+        firstThread.isCodexAppSession = true
+        firstThread.isProcessAlive = true
+
+        var secondThread = AgentSession(
+            id: "codex-app-thread-2",
+            title: "Codex · open-island",
+            tool: .codex,
+            origin: .live,
+            attachmentState: .attached,
+            phase: .completed,
+            summary: "Second Codex.app thread",
+            updatedAt: now.addingTimeInterval(-30),
+            jumpTarget: JumpTarget(
+                terminalApp: "Codex.app",
+                workspaceName: "open-island",
+                paneTitle: "Codex · open-island",
+                workingDirectory: "/tmp/open-island",
+                codexThreadID: "codex-app-thread-2"
+            )
+        )
+        secondThread.isCodexAppSession = true
+        secondThread.isProcessAlive = true
+
+        model.state = SessionState(sessions: [firstThread, secondThread])
+
+        #expect(model.surfacedSessions.map(\.id) == ["codex-app-thread-1", "codex-app-thread-2"])
+        #expect(model.liveSessionCount == 2)
+    }
+
+    @Test
     func sessionBootstrapPlaceholderAppearsWhileStartupResolutionIsPending() {
         let now = Date(timeIntervalSince1970: 2_000)
         let model = AppModel()

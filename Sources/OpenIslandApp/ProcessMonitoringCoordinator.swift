@@ -971,6 +971,18 @@ final class ProcessMonitoringCoordinator {
             return nil
         }
 
+        if session.isCodexAppSession || terminalApp == "Codex.app" {
+            let threadID = jumpTarget.codexThreadID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let disambiguator: String
+            if let threadID, !threadID.isEmpty {
+                disambiguator = threadID
+            } else {
+                disambiguator = session.id
+            }
+            return "codex.app:thread:\(disambiguator.lowercased())"
+        }
+
         if let terminalSessionID = jumpTarget.terminalSessionID?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !terminalSessionID.isEmpty {

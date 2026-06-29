@@ -29,6 +29,10 @@ final class ProcessMonitoringCoordinator {
     @ObservationIgnored
     var onCodexAppRunningChanged: ((_ isRunning: Bool) -> Void)?
 
+    /// Fires on each monitor tick while Codex.app is running (every ~2s).
+    @ObservationIgnored
+    var onCodexAppMaintenanceTick: (() -> Void)?
+
     @ObservationIgnored
     let activeAgentProcessDiscovery = ActiveAgentProcessDiscovery()
 
@@ -49,6 +53,7 @@ final class ProcessMonitoringCoordinator {
     private static let activePollInterval: TimeInterval = 60
     private static let idlePollInterval: TimeInterval = 300
     private static let cursorStalenessTimeout: TimeInterval = 600  // 10 minutes
+    private static let codexAppStalenessTimeout: TimeInterval = 600  // 10 minutes
     private static let claudeDesktopStalenessTimeout: TimeInterval = 600  // 10 minutes
 
     static func monitoringPollInterval(
@@ -145,12 +150,17 @@ final class ProcessMonitoringCoordinator {
 
                         return (s, g, t, j)
                     }.value
+                    let isCodexAppRunning = Self.isCodexDesktopAppRunning()
                     self.reconcileSessionAttachments(
                         activeProcesses: snapshots,
                         ghosttyAvailability: ghosttyAvail,
                         terminalAvailability: terminalAvail,
-                        preResolvedJumpTargets: jumpTargets
+                        preResolvedJumpTargets: jumpTargets,
+                        observedCodexAppRunning: isCodexAppRunning
                     )
+                    if isCodexAppRunning {
+                        self.onCodexAppMaintenanceTick?()
+                    }
 
                     let pollInterval = Self.monitoringPollInterval(
                         isResolvingInitialLiveSessions: self.isResolvingInitialLiveSessions,
@@ -159,7 +169,10 @@ final class ProcessMonitoringCoordinator {
                     nextFullReconcileAt = Date().addingTimeInterval(pollInterval)
                     hadTrackedLiveSessions = self.state.sessions.contains(where: \.isTrackedLiveSession)
                 } else {
-                    self.reconcileCodexAppRunningState()
+                    let isCodexAppRunning = self.reconcileCodexAppRunningState()
+                    if isCodexAppRunning {
+                        self.onCodexAppMaintenanceTick?()
+                    }
                     hadTrackedLiveSessions = hasTrackedLiveSessions
                 }
 
@@ -173,8 +186,8 @@ final class ProcessMonitoringCoordinator {
     }
 
     @discardableResult
-    private func reconcileCodexAppRunningState() -> Bool {
-        let isCodexAppRunning = Self.isCodexDesktopAppRunning()
+    private func reconcileCodexAppRunningState(_ observedCodexAppRunning: Bool? = nil) -> Bool {
+        let isCodexAppRunning = observedCodexAppRunning ?? Self.isCodexDesktopAppRunning()
         if isCodexAppRunning != wasCodexAppRunning {
             wasCodexAppRunning = isCodexAppRunning
             onCodexAppRunningChanged?(isCodexAppRunning)
@@ -188,7 +201,8 @@ final class ProcessMonitoringCoordinator {
         activeProcesses: [ActiveProcessSnapshot]? = nil,
         ghosttyAvailability: TerminalSessionAttachmentProbe.SnapshotAvailability<TerminalSessionAttachmentProbe.GhosttyTerminalSnapshot>? = nil,
         terminalAvailability: TerminalSessionAttachmentProbe.SnapshotAvailability<TerminalSessionAttachmentProbe.TerminalTabSnapshot>? = nil,
-        preResolvedJumpTargets: [String: JumpTarget]? = nil
+        preResolvedJumpTargets: [String: JumpTarget]? = nil,
+        observedCodexAppRunning: Bool? = nil
     ) {
         let activeProcesses = activeProcesses ?? activeAgentProcessDiscovery.discover()
 
@@ -217,7 +231,7 @@ final class ProcessMonitoringCoordinator {
         // return — we need to fire the callback on a brand-new Codex.app
         // launch even when no sessions exist yet, so the app-server
         // coordinator can connect and report threads.
-        let isCodexAppRunning = reconcileCodexAppRunningState()
+        let isCodexAppRunning = reconcileCodexAppRunningState(observedCodexAppRunning)
         let sessions = local.sessions.filter(\.isTrackedLiveSession)
         guard !sessions.isEmpty else {
             // Flush local changes only if something actually changed.
@@ -256,7 +270,10 @@ final class ProcessMonitoringCoordinator {
         _ = local.reconcileJumpTargets(jumpTargetUpdates)
 
         // Phase 1: populate isProcessAlive in parallel with existing system.
-        let aliveIDs = sessionIDsWithAliveProcesses(activeProcesses: activeProcesses)
+        let aliveIDs = sessionIDsWithAliveProcesses(
+            activeProcesses: activeProcesses,
+            isCodexAppRunning: isCodexAppRunning
+        )
         _ = local.markProcessLiveness(
             aliveSessionIDs: aliveIDs,
             isCodexAppRunning: isCodexAppRunning
@@ -355,7 +372,8 @@ final class ProcessMonitoringCoordinator {
     /// heuristics (e.g. bundle-ID liveness for Cursor, PID matching for
     /// Codex/Claude/Gemini).
     func sessionIDsWithAliveProcesses(
-        activeProcesses: [ActiveProcessSnapshot]
+        activeProcesses: [ActiveProcessSnapshot],
+        isCodexAppRunning: Bool
     ) -> Set<String> {
         var aliveIDs: Set<String> = []
         let sessions = state.sessions
@@ -367,10 +385,16 @@ final class ProcessMonitoringCoordinator {
                 .compactMap(\.sessionID)
         )
         // Codex.app sessions: keep alive while the desktop app is running.
-        let isCodexAppRunning = Self.isCodexDesktopAppRunning()
         for session in sessions where session.tool == .codex && !session.isDemoSession {
             if session.isCodexAppSession {
-                if isCodexAppRunning { aliveIDs.insert(session.id) }
+                if session.isSessionEnded {
+                    continue
+                }
+                let isStale = session.phase == .completed
+                    && session.updatedAt.addingTimeInterval(Self.codexAppStalenessTimeout) < Date.now
+                if isCodexAppRunning, !isStale {
+                    aliveIDs.insert(session.id)
+                }
             } else if codexProcessIDs.contains(session.id) {
                 aliveIDs.insert(session.id)
             }

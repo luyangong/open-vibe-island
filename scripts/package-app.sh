@@ -25,9 +25,20 @@ entitlements_path="$repo_root/config/packaging/OpenIslandApp.entitlements"
 
 cd "$repo_root"
 
+# Target architecture selection.
+#   OPEN_ISLAND_UNIVERSAL=true   → universal binary (arm64 + x86_64)
+#   OPEN_ISLAND_ARCH=<arch>      → single explicit arch (e.g. x86_64 for an
+#                                  Intel-only build, cross-compiled from an
+#                                  Apple Silicon runner)
+#   neither                      → host-native build
 arch_flags=()
+target_arch="$(uname -m)"
 if [[ "${OPEN_ISLAND_UNIVERSAL:-false}" == "true" ]]; then
     arch_flags=(--arch arm64 --arch x86_64)
+    target_arch="universal"
+elif [[ -n "${OPEN_ISLAND_ARCH:-}" ]]; then
+    arch_flags=(--arch "${OPEN_ISLAND_ARCH}")
+    target_arch="${OPEN_ISLAND_ARCH}"
 fi
 
 swift build -c release "${arch_flags[@]}" --product OpenIslandApp
@@ -144,6 +155,17 @@ echo "Bundle structure verified."
 # --- Smoke-test the app outside the repo to catch Bundle.module fallback hacks ---
 # SPM's generated resource accessor has a hardcoded fallback to the local .build/
 # directory. Running from /tmp ensures the app works without that crutch.
+#
+# Skip when the built binary can't run on this host — a cross-compiled single-arch
+# build (e.g. x86_64 produced on an Apple Silicon runner) would need Rosetta, which
+# CI runners don't have. Universal and host-native builds always include the host slice.
+skip_smoke="${OPEN_ISLAND_SKIP_SMOKE:-false}"
+if [[ "$target_arch" != "universal" && "$target_arch" != "$(uname -m)" ]]; then
+    skip_smoke="true"
+    echo "Skipping launch smoke test — built for $target_arch, host is $(uname -m) (cross-compile)."
+fi
+
+if [[ "$skip_smoke" != "true" ]]; then
 smoke_dir="$(mktemp -d)/smoke-test"
 mkdir -p "$smoke_dir"
 cp -R "$bundle_dir" "$smoke_dir/"
@@ -168,6 +190,7 @@ if [[ -x "$smoke_binary" ]]; then
     rm -rf "$(dirname "$smoke_dir")"
 else
     echo "WARNING: smoke test skipped — binary not found at $smoke_binary" >&2
+fi
 fi
 
 sparkle_fw="$bundle_dir/Contents/Frameworks/Sparkle.framework"

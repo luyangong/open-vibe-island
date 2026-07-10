@@ -1,0 +1,113 @@
+name: Build Intel DMG
+
+# Produces an Intel-only (x86_64) DMG on demand.
+#
+# There is no GitHub runner that is BOTH Intel and new enough to run the
+# Swift 6.2 toolchain (the last Intel image, macos-13, tops out at Xcode 15).
+# So the x86_64 slice is CROSS-COMPILED on macos-26 (Apple Silicon, Xcode 26)
+# via `swift build --arch x86_64`, driven by OPEN_ISLAND_ARCH in package-app.sh.
+#
+# The shipped release DMG is already universal (arm64 + x86_64) and runs
+# natively on Intel — use this workflow only when you need an Intel-only build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version string, e.g. 1.1.4 (defaults to the latest tag)."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build-intel:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          v="${{ inputs.version }}"
+          if [[ -z "$v" ]]; then
+            v="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || echo 0.0.0)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building Intel DMG for version $v"
+
+      - name: Install dependencies
+        run: |
+          brew install create-dmg
+          pip3 install --break-system-packages Pillow
+
+      - name: Import signing certificate (optional)
+        id: signing
+        env:
+          CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          if [[ -z "$CERTIFICATE_P12" ]]; then
+            echo "::warning::No APPLE_CERTIFICATE_P12 secret — producing an ad-hoc (unsigned) Intel DMG."
+            echo "identity=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CERT_FILE="$(mktemp).p12"
+          echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_FILE"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_FILE" -P "$CERTIFICATE_PASSWORD" -A -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          echo "identity=${{ secrets.APPLE_SIGNING_IDENTITY }}" >> "$GITHUB_OUTPUT"
+          rm -f "$CERT_FILE"
+
+      - name: Build and package (Intel / x86_64)
+        env:
+          OPEN_ISLAND_APP_NAME: "Open Island"
+          OPEN_ISLAND_BUNDLE_ID: "app.openisland.OpenIsland"
+          OPEN_ISLAND_VERSION: ${{ steps.version.outputs.version }}
+          OPEN_ISLAND_BUILD_NUMBER: ${{ github.run_number }}
+          OPEN_ISLAND_ARCH: "x86_64"
+          OPEN_ISLAND_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: zsh scripts/package-app.sh
+
+      - name: Verify the binary is x86_64-only
+        run: |
+          bin="output/package/Open Island.app/Contents/MacOS/OpenIslandApp"
+          echo "--- lipo -info ---"
+          lipo -info "$bin"
+          if ! lipo -info "$bin" | grep -q "x86_64"; then
+            echo "::error::Binary does not contain an x86_64 slice"
+            exit 1
+          fi
+          if lipo -info "$bin" | grep -qw "arm64"; then
+            echo "::error::Binary unexpectedly contains arm64 — expected x86_64-only"
+            exit 1
+          fi
+          echo "Confirmed: x86_64-only build."
+
+      - name: Rename artifacts for clarity
+        run: |
+          cd output/package
+          mv "Open Island.dmg" "Open Island (Intel).dmg"
+          mv "Open Island.zip" "Open Island (Intel).zip"
+
+      - name: Upload Intel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: open-island-intel-x86_64
+          path: |
+            output/package/Open Island (Intel).dmg
+            output/package/Open Island (Intel).zip
+          if-no-files-found: error
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" 2>/dev/null || true
